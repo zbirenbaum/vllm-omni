@@ -72,3 +72,19 @@ class CreateAudio(BaseModel):
 class AudioResponse(BaseModel):
     audio_data: bytes | str
     media_type: str
+
+
+class RegisterVoiceRequest(BaseModel):
+    name: str = Field(description="Human-readable name for this voice")
+    ref_audio: str = Field(description="Reference audio as URL or base64 data URL")
+    ref_text: str | None = Field(
+        default=None,
+        description="Transcript of reference audio (recommended for ICL mode quality)",
+    )
+
+
+class RegisteredVoiceResponse(BaseModel):
+    voice_id: str
+    name: str
+    ref_text: str | None = None
+    created_at: int = 0

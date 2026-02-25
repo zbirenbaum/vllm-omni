@@ -2,7 +2,9 @@ import asyncio
 import base64
 import io
 import ipaddress
+import re
 import socket
+import time
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -20,6 +22,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    RegisterVoiceRequest,
+    RegisteredVoiceResponse,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -65,6 +69,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         self._tts_tokenizer = None
+
+        # Voice registry: maps voice_id -> {name, ref_audio_data, ref_text, created_at}
+        # ref_audio_data is a tuple of (wav_samples_list, sample_rate) ready for injection.
+        self._registered_voices: dict[str, dict[str, Any]] = {}
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -148,9 +156,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Validate Base task requirements
         if task_type == "Base":
             if request.ref_audio is None:
-                return "Base task requires 'ref_audio' for voice cloning"
-            # Validate ref_audio format
-            if not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
+                # Check if voice references a registered voice.
+                if request.voice and request.voice.lower() in self._registered_voices:
+                    pass  # Will be resolved in create_speech.
+                else:
+                    return "Base task requires 'ref_audio' for voice cloning (or use a registered voice name)"
+            elif not (request.ref_audio.startswith(("http://", "https://")) or request.ref_audio.startswith("data:")):
                 return "ref_audio must be a URL (http/https) or base64 data URL (data:...)"
 
         # Validate cross-parameter dependencies
@@ -310,11 +321,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # operates on codec tokens; text token IDs exceed codec vocab.
                 # model.preprocess replaces all embeddings, so placeholder value
                 # is irrelevant -- but length must match to avoid excess padding.
+                # Resolve registered voice if ref_audio is not provided but voice matches.
+                if (
+                    request.ref_audio is None
+                    and request.voice
+                    and request.voice.lower() in self._registered_voices
+                ):
+                    voice_data = self._registered_voices[request.voice.lower()]
+                    if request.task_type is None:
+                        request.task_type = "Base"
+                    if request.ref_text is None and voice_data["ref_text"]:
+                        request.ref_text = voice_data["ref_text"]
+
                 tts_params = self._build_tts_params(request)
 
                 if request.ref_audio is not None:
                     wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                     tts_params["ref_audio"] = [[wav_list, sr]]
+                elif request.voice and request.voice.lower() in self._registered_voices:
+                    voice_data = self._registered_voices[request.voice.lower()]
+                    tts_params["ref_audio"] = [list(voice_data["ref_audio_data"])]
 
                 ph_len = self._estimate_prompt_len(tts_params)
                 prompt = {
@@ -407,3 +433,58 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    # -------------------- Voice registry --------------------
+
+    @staticmethod
+    def _slugify(name: str) -> str:
+        slug = name.lower().strip()
+        slug = re.sub(r"[^a-z0-9]+", "-", slug)
+        return slug.strip("-") or "voice"
+
+    async def register_voice(self, request: RegisterVoiceRequest) -> RegisteredVoiceResponse:
+        voice_id = self._slugify(request.name)
+        if voice_id in self._registered_voices:
+            # Append numeric suffix to avoid collision.
+            i = 2
+            while f"{voice_id}-{i}" in self._registered_voices:
+                i += 1
+            voice_id = f"{voice_id}-{i}"
+
+        wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+        created_at = int(time.time())
+
+        self._registered_voices[voice_id] = {
+            "name": request.name,
+            "ref_audio_data": (wav_list, sr),
+            "ref_text": request.ref_text,
+            "created_at": created_at,
+        }
+        logger.info("Registered voice '%s' as '%s'", request.name, voice_id)
+        return RegisteredVoiceResponse(
+            voice_id=voice_id,
+            name=request.name,
+            ref_text=request.ref_text,
+            created_at=created_at,
+        )
+
+    def list_registered_voices(self) -> list[RegisteredVoiceResponse]:
+        return [
+            RegisteredVoiceResponse(
+                voice_id=vid,
+                name=data["name"],
+                ref_text=data["ref_text"],
+                created_at=data["created_at"],
+            )
+            for vid, data in self._registered_voices.items()
+        ]
+
+    def delete_registered_voice(self, voice_id: str) -> bool:
+        if voice_id not in self._registered_voices:
+            return False
+        del self._registered_voices[voice_id]
+        logger.info("Deleted registered voice '%s'", voice_id)
+        return True
+
+    def get_registered_voice(self, voice_id: str) -> dict[str, Any] | None:
+        return self._registered_voices.get(voice_id)

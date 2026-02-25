@@ -97,6 +97,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationResponse,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.protocol.audio import RegisterVoiceRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
@@ -846,7 +847,46 @@ async def list_voices(raw_request: Request):
         return base(raw_request).create_error_response(message="The model does not support Speech API")
 
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
-    return JSONResponse(content={"voices": speakers})
+    registered = [v.model_dump() for v in handler.list_registered_voices()]
+    return JSONResponse(content={"voices": speakers, "registered": registered})
+
+
+@router.post(
+    "/v1/audio/voices",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.CREATED.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def register_voice(request: RegisterVoiceRequest, raw_request: Request):
+    """Register a voice for reuse in speech synthesis without resending audio."""
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    try:
+        result = await handler.register_voice(request)
+        return JSONResponse(content=result.model_dump(), status_code=HTTPStatus.CREATED.value)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
+
+
+@router.delete(
+    "/v1/audio/voices/{voice_id}",
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+    },
+)
+async def delete_voice(voice_id: str, raw_request: Request):
+    """Delete a registered voice."""
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    if not handler.delete_registered_voice(voice_id):
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail=f"Voice '{voice_id}' not found")
+    return JSONResponse(content={"deleted": True, "voice_id": voice_id})
 
 
 # Health and Model endpoints for diffusion mode

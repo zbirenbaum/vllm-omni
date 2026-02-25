@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
 import io
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -397,6 +398,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+
+        # Cache for extracted voice embeddings keyed by audio content hash.
+        # Avoids re-running speaker encoder and speech tokenizer on repeated
+        # requests with the same reference audio.
+        self._voice_embed_cache: dict[str, dict[str, torch.Tensor]] = {}
+        self._voice_embed_cache_max_size: int = int(os.environ.get("VOICE_EMBED_CACHE_SIZE", "1000"))
 
     # -------------------- vLLM required hooks --------------------
 
@@ -1115,6 +1122,49 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
         raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
 
+    @staticmethod
+    def _audio_cache_key(wav: np.ndarray, sr: int) -> str:
+        h = hashlib.sha256(wav.tobytes())
+        h.update(str(sr).encode())
+        return h.hexdigest()[:24]
+
+    def _get_cached_voice_embeds(
+        self,
+        wav: np.ndarray,
+        sr: int,
+        *,
+        need_ref_code: bool,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        key = self._audio_cache_key(wav, sr)
+        cached = self._voice_embed_cache.get(key)
+        if cached is not None:
+            spk = cached["speaker_embed"].to(device=device, dtype=torch.bfloat16)
+            ref_code = cached.get("ref_code")
+            if ref_code is not None:
+                ref_code = ref_code.to(device=device, dtype=torch.long)
+            elif need_ref_code:
+                ref_code = self._encode_ref_audio_to_code(wav, sr).to(device=device)
+                cached["ref_code"] = ref_code.cpu()
+            logger.info("Voice embedding cache hit for key %s", key)
+            return spk, ref_code
+
+        # Cache miss: compute both.
+        logger.info("Voice embedding cache miss for key %s, extracting embeddings", key)
+        spk = self._extract_speaker_embedding(wav, sr)
+        ref_code = self._encode_ref_audio_to_code(wav, sr).to(device=device) if need_ref_code else None
+
+        # Evict oldest entry if at capacity.
+        if len(self._voice_embed_cache) >= self._voice_embed_cache_max_size:
+            oldest = next(iter(self._voice_embed_cache))
+            del self._voice_embed_cache[oldest]
+
+        entry: dict[str, torch.Tensor] = {"speaker_embed": spk.cpu()}
+        if ref_code is not None:
+            entry["ref_code"] = ref_code.cpu()
+        self._voice_embed_cache[key] = entry
+        return spk.to(device=device, dtype=torch.bfloat16), ref_code
+
     def _generate_icl_prompt(
         self,
         *,
@@ -1314,26 +1364,35 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
                 ref_code_len = int(ref_code_t.shape[0])
             elif in_context_mode:
-                # Compute ref_code from ref_audio if not provided.
+                # Compute ref_code from ref_audio if not provided -- use cache.
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
-                ref_code_t = self._encode_ref_audio_to_code(wav_np, sr).to(device=input_ids.device)
+                cached_spk, cached_code = self._get_cached_voice_embeds(
+                    wav_np, sr, need_ref_code=True, device=input_ids.device,
+                )
+                ref_code_t = cached_code
                 ref_code_len = int(ref_code_t.shape[0])
+                # Also set speaker_embed from cache to avoid double extraction below.
+                speaker_embed = cached_spk.view(1, 1, -1)
 
-            # Speaker embedding: use prompt embed if provided; otherwise extract from audio.
+            # Speaker embedding: use prompt embed if provided; otherwise extract from audio (cached).
             spk = None
             if voice_clone_prompt is not None:
                 spk = _as_singleton(voice_clone_prompt.get("ref_spk_embedding"))
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=torch.bfloat16).view(1, 1, -1)
-            else:
+            elif speaker_embed is None:
+                # x_vector_only path or ICL path that didn't go through the cache above.
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
                     raise ValueError("Base requires `ref_audio`.")
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
-                speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+                cached_spk, _ = self._get_cached_voice_embeds(
+                    wav_np, sr, need_ref_code=False, device=input_ids.device,
+                )
+                speaker_embed = cached_spk.view(1, 1, -1)
 
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 

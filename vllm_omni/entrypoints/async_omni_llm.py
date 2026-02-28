@@ -118,6 +118,10 @@ class AsyncOmniLLM(AsyncLLM):
             mm_registry=mm_registry,
         )
 
+        # Expose the renderer created by InputProcessor so inherited methods
+        # (tokenizer, get_tokenizer, reset_mm_cache, etc.) work correctly.
+        self.renderer = self.input_processor.renderer
+
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = MultimodalOutputProcessor(
             tokenizer=tokenizer,

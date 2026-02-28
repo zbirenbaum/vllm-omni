@@ -98,6 +98,7 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
+        language_model_only: bool,
         limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
         enable_mm_embeds: bool | None,
         media_io_kwargs: dict[str, dict[str, Any]] | None,
@@ -111,7 +112,6 @@ class OmniModelConfig(ModelConfig):
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
-        language_model_only: bool = False,
     ) -> None:
         # Call parent's __post_init__ to handle all standard ModelConfig initialization
         super().__post_init__(

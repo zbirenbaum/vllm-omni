@@ -1,6 +1,5 @@
 ARG BASE_IMAGE=ghcr.io/zbirenbaum/vllm:latest
 FROM ${BASE_IMAGE} AS final
-FROM ${VLLM_BASE_IMAGE}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
 

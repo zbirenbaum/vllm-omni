@@ -22,4 +22,7 @@ RUN cp -r ${COMMON_WORKDIR}/vllm-omni/vllm_omni/. ${COMMON_WORKDIR}/vllm_omni/
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-ENTRYPOINT []
+# Entrypoint: clone latest vllm-omni source at startup, then exec the command
+RUN printf '#!/bin/bash\nset -e\necho "[entrypoint] Syncing latest vllm-omni from GitHub..."\nTMPDIR=$(mktemp -d)\ngit clone --depth 1 https://github.com/zbirenbaum/vllm-omni.git "$TMPDIR"\ncp -r "$TMPDIR/vllm_omni/." /app/vllm_omni/\nrm -rf "$TMPDIR"\necho "[entrypoint] Sync complete. Running: $*"\nexec "$@"\n' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

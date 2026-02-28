@@ -90,12 +90,10 @@ class OmniInputProcessor(InputProcessor):
         vllm_config: VllmConfig,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-        super().__init__(vllm_config, mm_registry)
+        super().__init__(vllm_config, mm_registry=mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
-            self.model_config,
-            vllm_config.observability_config,
-            mm_registry,
-            mm_processor_cache=self.mm_processor_cache,
+            vllm_config,
+            mm_registry=mm_registry,
         )
 
     def process_inputs(

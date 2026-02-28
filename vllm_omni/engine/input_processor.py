@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 try:
     from vllm.multimodal.processing import set_request_id
@@ -152,29 +152,6 @@ class OmniInputProcessor(InputProcessor):
         if arrival_time is None:
             arrival_time = time.time()
 
-        # Optionally generate multimodal hash overrides to avoid hashing
-        # multimodal data items by their content as their identifiers.
-
-        # NOTE: when users explicitly turn off BOTH prefix caching and input
-        # processing caching, no multimodal features or embeddings will be
-        # reused across requests, therefore identifying multimodal data items
-        # by their content is no longer necessary, and we create uuids with
-        # request id-modality-index as multimodal hash overrides.
-        if (
-            self.model_config.multimodal_config
-            and self.model_config.multimodal_config.mm_processor_cache_gb == 0
-            and not self.cache_config.enable_prefix_caching
-        ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
-        else:
-            # Otherwise, use user-provided uuids as multimodal hash overrides
-            # if provided.
-            self._validate_mm_uuids(prompt)
-            if isinstance(prompt, dict):
-                mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
-            else:
-                mm_uuids = None
-
         # Process inputs, which includes:
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
@@ -183,7 +160,6 @@ class OmniInputProcessor(InputProcessor):
             processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
             )
 
         current_platform.validate_request(
